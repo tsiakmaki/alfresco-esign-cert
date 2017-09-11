@@ -1,5 +1,6 @@
 package es.keensoft.alfresco.behaviour;
 
+import java.io.IOException;
 import java.io.InputStream;
 import java.io.Serializable;
 import java.security.KeyStore;
@@ -8,6 +9,7 @@ import java.security.Security;
 import java.security.cert.X509Certificate;
 import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
 
 import org.alfresco.model.ContentModel;
@@ -15,6 +17,7 @@ import org.alfresco.repo.node.NodeServicePolicies;
 import org.alfresco.repo.policy.Behaviour.NotificationFrequency;
 import org.alfresco.repo.policy.JavaBehaviour;
 import org.alfresco.repo.policy.PolicyComponent;
+import org.alfresco.repo.security.authentication.AuthenticationUtil;
 import org.alfresco.service.cmr.repository.AssociationRef;
 import org.alfresco.service.cmr.repository.ChildAssociationRef;
 import org.alfresco.service.cmr.repository.ContentData;
@@ -61,40 +64,80 @@ public class CustomBehaviour implements
 
 	@Override
 	public void onCreateNode(ChildAssociationRef childNodeRef) {
-
-		NodeRef node = childNodeRef.getChildRef();
 		
-		if(!nodeService.exists(node)) {
-			return; 
+		final NodeRef node = childNodeRef.getChildRef();
+		
+		if (!nodeService.exists(node)) {
+            return;
 		}
-		
-		// if onCreateNode the document hasSignedAspect, the document is being copied inside alfresco 
+
+		// if onCreateNode the document hasSignedAspect, the document has not been 
+		// uploaded by a user. It has been copied/ moved inside alfresco. 
 		boolean hasSignedAspect = nodeService.hasAspect(node, SignModel.ASPECT_SIGNED);
 		
-		if (!hasSignedAspect) {
-			ContentData contentData = (ContentData) nodeService.getProperty(node, ContentModel.PROP_CONTENT);
-			// Do this check only if the uploaded document is a PDF
-			if (contentData != null && contentData.getMimetype().equalsIgnoreCase("application/pdf")) {
-				ArrayList<Map<QName, Serializable>> signatures = getDigitalSignatures(node);
-				if(signatures != null) {
-					for(Map<QName, Serializable> aspectProperties : signatures) {
-						String originalFileName = nodeService.getProperty(node, ContentModel.PROP_NAME).toString();
-						String signatureFileName = FilenameUtils.getBaseName(originalFileName) + "-" 
-						+ System.currentTimeMillis() + "-" + PADES;
+		if (hasSignedAspect) {
+			
+			List<ChildAssociationRef> assocs = nodeService.getChildAssocs(node);
+			
+			// remove every signature that had been associated in the past 
+			for(ChildAssociationRef a : assocs) {
+				
+				NodeRef signatureNodeRef = a.getChildRef();
+				
+				nodeService.removeAssociation(node, signatureNodeRef, SignModel.ASSOC_SIGNATURE);
+				logger.info("DeleteAssociation: from=" + node.getId() + " to="  + signatureNodeRef.getId() + " model=" + SignModel.ASSOC_SIGNATURE);
+				
+				nodeService.removeAssociation(signatureNodeRef, node, SignModel.ASSOC_DOC);
+				logger.info("DeleteAssociation: from=" + signatureNodeRef.getId() + " to="  + node.getId() + " model=" + SignModel.ASSOC_DOC);
+				
+				nodeService.deleteNode(signatureNodeRef);
+				logger.info("deleteNode: nodeRef=" + signatureNodeRef);
+			}
+			
+			nodeService.removeAspect(node, SignModel.ASPECT_SIGNED);
+			logger.info("removeAspect: to=" + node.getId());
+		}
+		
+		// if the new document is pdf, and contains digital signature(s), 
+		// create (for each signature) a empty document to represent the digital signature
+		// create associations between the document and the signature (back and forth)
+		// add the sign aspect to the document 
+		// we run them as admin to avoid child association exceptions, because of our alfresco sites settings and permittions 
+		ContentData contentData = (ContentData) nodeService.getProperty(node, ContentModel.PROP_CONTENT);
+		// Do this check only if the uploaded document is a PDF
+		if (contentData != null && contentData.getMimetype().equalsIgnoreCase("application/pdf")) {
+			ArrayList<Map<QName, Serializable>> signatures = getDigitalSignatures(node);
+
+			if(signatures != null) {
+				// for each signature found in the pdf file
+				for(final Map<QName, Serializable> aspectProperties : signatures) {
+					String originalFileName = nodeService.getProperty(node, ContentModel.PROP_NAME).toString();
+					final String signatureFileName = FilenameUtils.getBaseName(originalFileName) + "-" 
+					+ System.currentTimeMillis() + "-" + PADES;
 					
-						// Creating a node reference without type (no content and no folder): remains invisible for Share
-						NodeRef signatureNodeRef = nodeService.createNode(
-								nodeService.getPrimaryParent(node).getParentRef(),
-								ContentModel.ASSOC_CONTAINS, 
-								QName.createQName(signatureFileName), 
-								ContentModel.TYPE_CMOBJECT).getChildRef();
-						
-						nodeService.createAssociation(node, signatureNodeRef, SignModel.ASSOC_SIGNATURE);
-						nodeService.createAssociation(signatureNodeRef, node, SignModel.ASSOC_DOC);
-						
-					    aspectProperties.put(SignModel.PROP_FORMAT, PADES);
-						nodeService.addAspect(signatureNodeRef, SignModel.ASPECT_SIGNATURE, aspectProperties);
-					}
+					// run as admin 
+					AuthenticationUtil.runAsSystem(new AuthenticationUtil.RunAsWork<Object>() {
+					      public Object doWork() throws Exception {
+					    	// Creating a node reference without type (no content and no folder): remains invisible for Share
+							NodeRef signatureNodeRef = nodeService.createNode(
+									nodeService.getPrimaryParent(node).getParentRef(),
+									ContentModel.ASSOC_CONTAINS, 
+									QName.createQName(signatureFileName), 
+									ContentModel.TYPE_CMOBJECT).getChildRef();
+							// associate document with signature
+							nodeService.createAssociation(node, signatureNodeRef, SignModel.ASSOC_SIGNATURE);
+							logger.info("CreateAssociation: from=" + node.getId() + " to="  + signatureNodeRef.getId() + " model=" + SignModel.ASSOC_SIGNATURE);
+							// associate signature with document
+							nodeService.createAssociation(signatureNodeRef, node, SignModel.ASSOC_DOC);
+							logger.info("CreateAssociation: from=" + signatureNodeRef.getId() + " to="  + node.getId() + " model=" + SignModel.ASSOC_DOC);
+							// add aspect 
+						    aspectProperties.put(SignModel.PROP_FORMAT, PADES);
+							nodeService.addAspect(signatureNodeRef, SignModel.ASPECT_SIGNATURE, aspectProperties);
+							logger.info("addAspect: to=" + signatureNodeRef.getId());
+
+							return null;
+					      }
+					});
 				}
 			}
 		}
@@ -107,12 +150,15 @@ public class CustomBehaviour implements
 		}
 	}
 	
+	
 	public ArrayList<Map<QName, Serializable>> getDigitalSignatures(NodeRef node) {
+		
+		InputStream is = null;
 		
 		try {
 		
 			ContentReader contentReader = contentService.getReader(node, ContentModel.PROP_CONTENT);
-			InputStream is = contentReader.getContentInputStream();
+			is = contentReader.getContentInputStream();
 			
 			// For SHA-256 and upper
 			loadBCProvider();
@@ -137,11 +183,21 @@ public class CustomBehaviour implements
 	    	    aspectSignatureProperties.put(SignModel.PROP_CERTIFICATE_ISSUER, certificate.getIssuerX500Principal().toString());   
 	    	    aspects.add(aspectSignatureProperties);
 	        }
+	        
+	        // As this verification can be included in a massive operation, closing files is required
+	        is.close();
+	        
 			return aspects;
 			
 		} catch (Exception e) {
 			
-			logger.error("No signature found!", e);
+			// Closing stream (!)
+			try {
+			    if (is != null) is.close();
+			} catch (IOException ioe) {}
+			
+			// Not every PDF has a signature inside
+			logger.warn("No signature found!", e);
 			return null;
 			
 			// WARN: Do not throw this exception up, as it will break WedDAV PDF files uploading 
